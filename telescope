@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Small local file and Git repository picker with no external dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+IGNORED_DIRS = {
+    ".cache",
+    ".git",
+    ".hg",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    ".vscode",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Pick a file by substring search and open it in $EDITOR."
+    )
+    parser.add_argument("query", nargs="*", help="text to match in file paths")
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=50,
+        help="maximum number of matches to show (default: 50)",
+    )
+    parser.add_argument(
+        "--root",
+        default=".",
+        help="directory to search from (default: current directory)",
+    )
+    parser.add_argument(
+        "--git-folders",
+        "--repos",
+        action="store_true",
+        help="search Git repository folders recursively instead of files",
+    )
+    return parser.parse_args()
+
+
+def normalized_parts(value: str) -> list[str]:
+    return [part.casefold() for part in value.split() if part]
+
+
+def matches_query(path: str, query_parts: list[str]) -> bool:
+    folded = path.casefold()
+    return all(part in folded for part in query_parts)
+
+
+def score(path: str, query: str) -> tuple[int, int, str]:
+    folded_path = path.casefold()
+    folded_query = query.casefold()
+    basename = os.path.basename(path).casefold()
+
+    if basename == folded_query:
+        rank = 0
+    elif basename.startswith(folded_query):
+        rank = 1
+    elif folded_query in basename:
+        rank = 2
+    elif folded_path.startswith(folded_query):
+        rank = 3
+    else:
+        rank = 4
+
+    return (rank, len(path), folded_path)
+
+
+def scan_files(root: Path) -> list[str]:
+    all_files: list[str] = []
+
+    for current_root, dirs, filenames in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in IGNORED_DIRS]
+
+        for name in filenames:
+            full_path = Path(current_root, name)
+            display_path = os.path.relpath(full_path, Path.cwd())
+            all_files.append(display_path)
+
+    return sorted(all_files)
+
+
+def scan_git_folders(root: Path) -> list[str]:
+    git_folders: list[str] = []
+
+    for current_root, dirs, filenames in os.walk(root):
+        current_path = Path(current_root)
+        if ".git" in dirs or ".git" in filenames:
+            git_folders.append(os.path.relpath(current_path, Path.cwd()))
+
+        dirs[:] = [name for name in dirs if name not in IGNORED_DIRS]
+
+    return sorted(git_folders)
+
+
+def filter_files(files: list[str], query: str) -> list[str]:
+    query_parts = normalized_parts(query)
+    matches = [path for path in files if not query_parts or matches_query(path, query_parts)]
+    return sorted(matches, key=lambda path: score(path, query))
+
+
+def remove_previous_word(value: str) -> str:
+    value = value.rstrip()
+    while value and not value[-1].isspace():
+        value = value[:-1]
+    return value.rstrip()
+
+
+def find_files(root: Path, query: str) -> list[str]:
+    return filter_files(scan_files(root), query)
+
+
+def draw_picker(
+    stdscr: curses.window,
+    files: list[str],
+    initial_query: str,
+    limit: int,
+) -> str | None:
+    curses.curs_set(1)
+    stdscr.keypad(True)
+
+    query = initial_query
+    selected = 0
+    scroll = 0
+
+    while True:
+        matches = filter_files(files, query)
+        height, width = stdscr.getmaxyx()
+        visible_count = max(1, min(limit, height - 3))
+
+        if selected >= len(matches):
+            selected = max(0, len(matches) - 1)
+        if selected < scroll:
+            scroll = selected
+        if selected >= scroll + visible_count:
+            scroll = selected - visible_count + 1
+
+        stdscr.erase()
+        prompt = f"> {query}"
+        stdscr.addnstr(0, 0, prompt, max(0, width - 1), curses.A_BOLD)
+        help_text = f"{len(matches)} match(es)"
+        stdscr.addnstr(1, 0, help_text, max(0, width - 1))
+
+        for row, path in enumerate(matches[scroll : scroll + visible_count], start=2):
+            absolute_index = scroll + row - 2
+            prefix = "> " if absolute_index == selected else "  "
+            attr = curses.A_REVERSE if absolute_index == selected else curses.A_NORMAL
+            stdscr.addnstr(row, 0, prefix + path, max(0, width - 1), attr)
+
+        stdscr.move(0, min(len(prompt), max(0, width - 1)))
+        stdscr.refresh()
+
+        key = stdscr.get_wch()
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            return matches[selected] if matches else None
+        if key in ("\x1b", "\x03"):
+            return None
+        if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+            query = query[:-1]
+            selected = 0
+            scroll = 0
+            continue
+        if key == "\x17":
+            query = remove_previous_word(query)
+            selected = 0
+            scroll = 0
+            continue
+        if key in (curses.KEY_UP, "\x10"):
+            selected = max(0, selected - 1)
+            continue
+        if key in (curses.KEY_DOWN, "\x0e"):
+            selected = min(max(0, len(matches) - 1), selected + 1)
+            continue
+        if key == curses.KEY_PPAGE:
+            selected = max(0, selected - visible_count)
+            continue
+        if key == curses.KEY_NPAGE:
+            selected = min(max(0, len(matches) - 1), selected + visible_count)
+            continue
+        if isinstance(key, str) and key.isprintable():
+            query += key
+            selected = 0
+            scroll = 0
+
+
+def live_choose_file(files: list[str], query: str, limit: int) -> str | None:
+    return curses.wrapper(draw_picker, files, query, limit)
+
+
+def open_file(path: str) -> int:
+    editor = os.environ.get("EDITOR", "vi")
+    return subprocess.run([editor, path]).returncode
+
+
+def open_shell_in_directory(path: str) -> int:
+    directory = Path(path).resolve()
+    if not directory.is_dir():
+        print(f"Not a directory: {directory}", file=sys.stderr)
+        return 2
+
+    shell = os.environ.get("SHELL", "/bin/sh")
+    if not os.path.isabs(shell) or not os.access(shell, os.X_OK):
+        shell = "/bin/sh"
+
+    os.chdir(directory)
+    os.execv(shell, [shell])
+    return 1
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.root).expanduser().resolve()
+    query = " ".join(args.query).strip()
+
+    if not root.is_dir():
+        print(f"Root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    files = scan_git_folders(root) if args.git_folders else scan_files(root)
+    if not files:
+        print("No Git folders found." if args.git_folders else "No files found.")
+        return 1
+
+    matches = filter_files(files, query)
+    if query and not matches:
+        print("No files matched.")
+        return 1
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("Live terminal UI requires a TTY.", file=sys.stderr)
+        return 2
+
+    selected = live_choose_file(files, query, args.limit)
+
+    if not selected:
+        return 1
+
+    if args.git_folders:
+        return open_shell_in_directory(selected)
+
+    return open_file(selected)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
