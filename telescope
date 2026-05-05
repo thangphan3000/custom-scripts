@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small local file and Git repository picker with no external dependencies."""
+"""Small local file, Git repository, and piped-line picker with no external dependencies."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ IGNORED_DIRS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pick a file by substring search and open it in $EDITOR."
+        description="Pick a file by substring search and open it in $EDITOR, or pick from piped lines."
     )
     parser.add_argument("query", nargs="*", help="text to match in file paths")
     parser.add_argument(
@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
         "--repos",
         action="store_true",
         help="search Git repository folders recursively instead of files",
+    )
+    parser.add_argument(
+        "--zsh-widget",
+        action="store_true",
+        help="print zsh widget code for inserting selected history into the prompt",
     )
     return parser.parse_args()
 
@@ -119,6 +124,14 @@ def filter_files(files: list[str], query: str) -> list[str]:
     return sorted(matches, key=lambda path: score(path, query))
 
 
+def filter_items(items: list[str], query: str, preserve_order: bool = False) -> list[str]:
+    query_parts = normalized_parts(query)
+    matches = [item for item in items if not query_parts or matches_query(item, query_parts)]
+    if preserve_order:
+        return matches
+    return sorted(matches, key=lambda item: score(item, query))
+
+
 def remove_previous_word(value: str) -> str:
     value = value.rstrip()
     while value and not value[-1].isspace():
@@ -132,9 +145,10 @@ def find_files(root: Path, query: str) -> list[str]:
 
 def draw_picker(
     stdscr: curses.window,
-    files: list[str],
+    items: list[str],
     initial_query: str,
     limit: int,
+    preserve_order: bool,
 ) -> str | None:
     curses.curs_set(1)
     stdscr.keypad(True)
@@ -144,7 +158,7 @@ def draw_picker(
     scroll = 0
 
     while True:
-        matches = filter_files(files, query)
+        matches = filter_items(items, query, preserve_order)
         height, width = stdscr.getmaxyx()
         visible_count = max(1, min(limit, height - 3))
 
@@ -203,8 +217,51 @@ def draw_picker(
             scroll = 0
 
 
-def live_choose_file(files: list[str], query: str, limit: int) -> str | None:
-    return curses.wrapper(draw_picker, files, query, limit)
+def live_choose_item(
+    items: list[str], query: str, limit: int, preserve_order: bool = False
+) -> str | None:
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return curses.wrapper(draw_picker, items, query, limit, preserve_order)
+
+    try:
+        tty = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        print("Live terminal UI requires a TTY.", file=sys.stderr)
+        return None
+
+    original_stdin = os.dup(sys.stdin.fileno())
+    original_stdout = os.dup(sys.stdout.fileno())
+
+    try:
+        os.dup2(tty, sys.stdin.fileno())
+        os.dup2(tty, sys.stdout.fileno())
+        return curses.wrapper(draw_picker, items, query, limit, preserve_order)
+    finally:
+        os.dup2(original_stdin, sys.stdin.fileno())
+        os.dup2(original_stdout, sys.stdout.fileno())
+        os.close(original_stdin)
+        os.close(original_stdout)
+        os.close(tty)
+
+
+def read_stdin_items() -> list[str]:
+    return [line.rstrip("\n") for line in sys.stdin]
+
+
+def print_zsh_widget() -> None:
+    print(
+        r'''_telescope_history_insert() {
+  emulate -L zsh
+
+  local selected
+  selected=$(fc -lnr 1 | telescope) || return
+
+  LBUFFER+=$selected
+  zle redisplay
+}
+
+zle -N telescope-history-insert _telescope_history_insert'''
+    )
 
 
 def open_file(path: str) -> int:
@@ -229,8 +286,30 @@ def open_shell_in_directory(path: str) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.zsh_widget:
+        print_zsh_widget()
+        return 0
+
     root = Path(args.root).expanduser().resolve()
     query = " ".join(args.query).strip()
+
+    if not sys.stdin.isatty():
+        items = read_stdin_items()
+        if not items:
+            print("No input lines found.", file=sys.stderr)
+            return 1
+
+        matches = filter_files(items, query)
+        if query and not matches:
+            print("No input lines matched.", file=sys.stderr)
+            return 1
+
+        selected = live_choose_item(items, query, args.limit, preserve_order=True)
+        if not selected:
+            return 1
+
+        print(selected)
+        return 0
 
     if not root.is_dir():
         print(f"Root is not a directory: {root}", file=sys.stderr)
@@ -246,11 +325,7 @@ def main() -> int:
         print("No files matched.")
         return 1
 
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print("Live terminal UI requires a TTY.", file=sys.stderr)
-        return 2
-
-    selected = live_choose_file(files, query, args.limit)
+    selected = live_choose_item(files, query, args.limit)
 
     if not selected:
         return 1
